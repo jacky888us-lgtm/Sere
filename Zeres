@@ -1,0 +1,833 @@
+-- FishMacro_v2.lua | Luau, executor context
+-- Records ONE fishing cycle you perform yourself: your client -> server calls AND the
+-- server -> client events in between. Replays the cycle in a loop. Tap a server event
+-- to make the replay WAIT for it, then send the next call right after it arrives.
+-- No remote names or arguments are hardcoded. Status: NOT run in any executor.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+----------------------------------------------------------------------
+-- Config. Everything here is UNCALIBRATED; tune in-game.
+----------------------------------------------------------------------
+local Config = {
+	StepSpeed = 0, -- multiplier on recorded gaps between played items; 0 = no waiting
+	CycleDelay = 0, -- seconds between cycles; 0 = one frame
+	EventTimeout = 15, -- seconds to wait for a marked server event
+	MaxConsecutiveFailures = 5,
+	NoiseLearnSeconds = 5,
+	-- Optional: function(itemIndex, args) -> args, for values that must change per cycle.
+	Transform = nil,
+}
+
+local MAX_ITEMS, MAX_PER_EVENT = 120, 3
+local MAX_STR, MAX_DEPTH, MAX_TABLE_ENTRIES = 60, 3, 16
+
+----------------------------------------------------------------------
+-- Capability check
+----------------------------------------------------------------------
+local hasNamecall = type(hookmetamethod) == "function"
+	and type(getnamecallmethod) == "function"
+	and type(newcclosure) == "function"
+	and type(checkcaller) == "function"
+local hasFnHook = type(hookfunction) == "function"
+	and type(newcclosure) == "function"
+	and type(checkcaller) == "function"
+if not hasNamecall and not hasFnHook then
+	warn("[FishMacro] executor tidak punya hookmetamethod/getnamecallmethod ATAU hookfunction -> berhenti")
+	return
+end
+
+----------------------------------------------------------------------
+-- Pure helpers
+----------------------------------------------------------------------
+local REMOTE_CLASSES = { RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true }
+
+local function serialize(v, depth, seen)
+	local t = typeof(v)
+	if t == "string" then
+		local s = #v > MAX_STR and (string.sub(v, 1, MAX_STR) .. "...") or v
+		return string.format("%q", s)
+	elseif t == "number" or t == "boolean" or t == "nil" then
+		return tostring(v)
+	elseif t == "Instance" then
+		local ok, full = pcall(v.GetFullName, v)
+		return ok and ("<" .. full .. ">") or "<Instance>"
+	elseif t == "table" then
+		if depth >= MAX_DEPTH then
+			return "{...}"
+		end
+		if seen[v] then
+			return "{<cycle>}"
+		end
+		seen[v] = true
+		local parts, n = {}, 0
+		for k, val in pairs(v) do
+			n += 1
+			if n > MAX_TABLE_ENTRIES then
+				parts[#parts + 1] = "..."
+				break
+			end
+			parts[#parts + 1] = "[" .. serialize(k, depth + 1, seen) .. "]=" .. serialize(val, depth + 1, seen)
+		end
+		seen[v] = nil
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	local ok, s = pcall(tostring, v)
+	return ok and (t .. ":" .. s) or t
+end
+
+local function serializeArgs(args)
+	local parts = {}
+	for i = 1, args.n do
+		parts[i] = serialize(args[i], 0, {})
+	end
+	return table.concat(parts, ", ")
+end
+
+-- Copies plain tables (cycle-safe); Instances and other values are kept by reference.
+local function snapshot(v, depth, seen)
+	if type(v) ~= "table" or depth >= 6 then
+		return v
+	end
+	if seen[v] then
+		return seen[v]
+	end
+	local c = {}
+	seen[v] = c
+	for k, val in pairs(v) do
+		c[snapshot(k, depth + 1, seen)] = snapshot(val, depth + 1, seen)
+	end
+	return c
+end
+
+local function snapshotArgs(args)
+	local out = { n = args.n }
+	for i = 1, args.n do
+		out[i] = snapshot(args[i], 0, {})
+	end
+	return out
+end
+
+local function hasDeadInstance(v, depth)
+	if typeof(v) == "Instance" then
+		return not v:IsDescendantOf(game)
+	end
+	if type(v) == "table" and depth < 4 then
+		for _, val in pairs(v) do
+			if hasDeadInstance(val, depth + 1) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function firstDeadArg(args)
+	for i = 1, args.n do
+		if hasDeadInstance(args[i], 0) then
+			return i
+		end
+	end
+	return nil
+end
+
+----------------------------------------------------------------------
+-- State + single cleanup path
+----------------------------------------------------------------------
+if _G.__FMStop then
+	pcall(_G.__FMStop)
+end
+
+local state = { running = true, mode = "idle", raw = 0, cycles = 0, timeouts = 0, seq = 0 }
+-- mode: idle | noise | record | replay
+local items, rows = {}, {}
+local noise, eventSeen = {}, {}
+local connections, listenConns, syncConns = {}, {}, {}
+local evCount, consumed = {}, {}
+local gui
+
+local function track(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(connections, c)
+	return c
+end
+
+local function disconnectAll(list)
+	for _, c in ipairs(list) do
+		c:Disconnect()
+	end
+	table.clear(list)
+end
+
+local function stop()
+	state.running = false
+	state.mode = "idle"
+	_G.__FMHandler = nil -- hooks stay installed as pass-throughs
+	disconnectAll(connections)
+	disconnectAll(listenConns)
+	disconnectAll(syncConns)
+	if gui then
+		gui:Destroy()
+		gui = nil
+	end
+	_G.__FMStop = nil
+end
+_G.__FMStop = stop
+
+----------------------------------------------------------------------
+-- UI
+----------------------------------------------------------------------
+local COLORS = {
+	bg = Color3.fromRGB(22, 28, 36),
+	bar = Color3.fromRGB(34, 48, 66),
+	item = Color3.fromRGB(32, 40, 54),
+	text = Color3.fromRGB(235, 240, 248),
+	dim = Color3.fromRGB(130, 140, 160),
+	ok = Color3.fromRGB(120, 220, 160),
+	bad = Color3.fromRGB(240, 120, 140),
+	on = Color3.fromRGB(80, 130, 220),
+	hit = Color3.fromRGB(255, 205, 110),
+}
+
+gui = Instance.new("ScreenGui")
+gui.Name = "FishMacro"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 60
+if not pcall(function() gui.Parent = (gethui and gethui()) or CoreGui end) then
+	gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function corner(inst, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 8)
+	c.Parent = inst
+end
+
+local function newLabel(parent, size, pos, textSize, color)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Size, l.Position = size, pos
+	l.Font = Enum.Font.Gotham
+	l.TextSize = textSize
+	l.TextColor3 = color
+	l.TextWrapped = true
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	l.Parent = parent
+	return l
+end
+
+local function makeButton(parent, text)
+	local b = Instance.new("TextButton")
+	b.BackgroundColor3 = COLORS.item
+	b.Text = text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.TextColor3 = COLORS.text
+	b.Parent = parent
+	corner(b, 6)
+	return b
+end
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(340, 460)
+main.Position = UDim2.new(0.5, -170, 0.5, -230)
+main.BackgroundColor3 = COLORS.bg
+main.BorderSizePixel = 0
+main.Parent = gui
+corner(main, 12)
+
+local bar = Instance.new("Frame")
+bar.Size = UDim2.new(1, 0, 0, 34)
+bar.BackgroundColor3 = COLORS.bar
+bar.BorderSizePixel = 0
+bar.Parent = main
+corner(bar, 12)
+
+local title = newLabel(bar, UDim2.new(1, -44, 1, 0), UDim2.fromOffset(12, 0), 14, COLORS.text)
+title.Font = Enum.Font.GothamBold
+title.TextYAlignment = Enum.TextYAlignment.Center
+title.Text = "Fish Macro v2"
+
+local closeBtn = makeButton(bar, "X")
+closeBtn.Size = UDim2.fromOffset(28, 24)
+closeBtn.Position = UDim2.new(1, -34, 0, 5)
+track(closeBtn.MouseButton1Click, stop)
+
+local buttonRow = Instance.new("Frame")
+buttonRow.BackgroundTransparency = 1
+buttonRow.Size = UDim2.new(1, -20, 0, 28)
+buttonRow.Position = UDim2.fromOffset(10, 42)
+buttonRow.Parent = main
+local rowLayout = Instance.new("UIListLayout")
+rowLayout.FillDirection = Enum.FillDirection.Horizontal
+rowLayout.Padding = UDim.new(0, 4)
+rowLayout.Parent = buttonRow
+
+local noiseBtn = makeButton(buttonRow, "Noise 5s")
+local recBtn = makeButton(buttonRow, "Rec")
+local runBtn = makeButton(buttonRow, "Run")
+for _, b in ipairs({ noiseBtn, recBtn, runBtn }) do
+	b.Size = UDim2.new(0.333, -3, 1, 0)
+end
+
+local function numberBox(placeholder, pos, initial)
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(0.5, -14, 0, 26)
+	box.Position = pos
+	box.BackgroundColor3 = COLORS.item
+	box.PlaceholderText = placeholder
+	box.PlaceholderColor3 = COLORS.dim
+	box.Text = tostring(initial)
+	box.ClearTextOnFocus = false
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 12
+	box.TextColor3 = COLORS.text
+	box.Parent = main
+	corner(box, 6)
+	return box
+end
+
+local speedBox = numberBox("speed (0 = tanpa jeda)", UDim2.fromOffset(10, 76), Config.StepSpeed)
+local delayBox = numberBox("jeda antar siklus (detik)", UDim2.new(0.5, 4, 0, 76), Config.CycleDelay)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -20, 1, -186)
+list.Position = UDim2.fromOffset(10, 108)
+list.BackgroundColor3 = COLORS.bg
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.CanvasSize = UDim2.new()
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = main
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 3)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = list
+
+local diagLabel = newLabel(main, UDim2.new(1, -20, 0, 30), UDim2.new(0, 10, 1, -74), 10, COLORS.dim)
+local msgLabel = newLabel(main, UDim2.new(1, -20, 0, 40), UDim2.new(0, 10, 1, -42), 11, COLORS.ok)
+msgLabel.Text = "1) Noise 5s (diam)  2) Rec: mancing 1 putaran, Stop rec  3) tap event server 'ikan gigit' = TUNGGU  4) Run"
+
+local function setMessage(text, good)
+	msgLabel.Text = text
+	msgLabel.TextColor3 = good and COLORS.ok or COLORS.bad
+end
+
+-- Drag by title bar (mouse and touch)
+do
+	local dragging, startInput, startPos
+	track(bar.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, startInput, startPos = true, input.Position, main.Position
+			local endConn
+			endConn = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					endConn:Disconnect()
+				end
+			end)
+		end
+	end)
+	track(UserInputService.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - startInput
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+end
+
+----------------------------------------------------------------------
+-- Item rows (kind = "call" | "event")
+----------------------------------------------------------------------
+local function rowText(it)
+	if it.kind == "call" then
+		return string.format("%d. %s:%s(%s)", it.index, it.path, it.method, serializeArgs(it.args))
+	end
+	return string.format("%d. <- %s%s(%s)", it.index, it.sync and "[TUNGGU] " or "", it.path, it.desc)
+end
+
+local function paintRow(row, it)
+	row.Text = rowText(it)
+	if it.kind == "call" then
+		row.BackgroundColor3 = COLORS.item
+		row.BackgroundTransparency = it.enabled and 0 or 0.7
+		row.TextTransparency = it.enabled and 0 or 0.5
+		row.TextColor3 = COLORS.text
+	else
+		row.BackgroundColor3 = it.sync and COLORS.on or COLORS.item
+		row.BackgroundTransparency = it.sync and 0 or 0.7
+		row.TextTransparency = it.sync and 0 or 0.35
+		row.TextColor3 = COLORS.hit
+	end
+end
+
+local function addRow(it)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -6, 0, 0)
+	b.AutomaticSize = Enum.AutomaticSize.Y
+	b.BackgroundColor3 = COLORS.item
+	b.TextWrapped = true
+	b.Font = Enum.Font.Code
+	b.TextSize = 11
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.LayoutOrder = it.index
+	b.Parent = list
+	corner(b, 4)
+	paintRow(b, it)
+	b.MouseButton1Click:Connect(function()
+		if state.mode == "replay" then
+			return
+		end
+		if it.kind == "call" then
+			it.enabled = not it.enabled
+		else
+			it.sync = not it.sync
+		end
+		paintRow(b, it)
+	end)
+	rows[it] = b
+end
+
+local function rebuildRows()
+	for _, r in pairs(rows) do
+		r:Destroy()
+	end
+	table.clear(rows)
+	for i, it in ipairs(items) do
+		it.index = i
+		addRow(it)
+	end
+end
+
+local function clearItems()
+	for _, r in pairs(rows) do
+		r:Destroy()
+	end
+	table.clear(rows)
+	table.clear(items)
+	table.clear(eventSeen)
+end
+
+local function pushItem(it)
+	state.seq += 1
+	it.seq = state.seq
+	table.insert(items, it)
+	it.index = #items
+	addRow(it)
+end
+
+----------------------------------------------------------------------
+-- Intake: client -> server calls (hook) and server -> client events (listeners)
+----------------------------------------------------------------------
+local function onCall(remote, method, args, t)
+	if not state.running or state.mode ~= "record" then
+		return
+	end
+	pcall(function()
+		if typeof(remote) ~= "Instance" or not REMOTE_CLASSES[remote.ClassName] then
+			return
+		end
+		local path = remote:GetFullName()
+		if noise["C:" .. path] or #items >= MAX_ITEMS then
+			return
+		end
+		pushItem({
+			kind = "call", remote = remote, method = method, path = path,
+			args = snapshotArgs(args), t = t, enabled = true,
+		})
+	end)
+end
+
+local function onCallNoise(remote)
+	pcall(function()
+		if typeof(remote) == "Instance" and REMOTE_CLASSES[remote.ClassName] then
+			noise["C:" .. remote:GetFullName()] = true
+		end
+	end)
+end
+
+_G.__FMHandler = function(self, method, ...)
+	if not state.running then
+		return
+	end
+	state.raw += 1
+	if state.mode == "noise" then
+		task.defer(onCallNoise, self)
+	elseif state.mode == "record" then
+		task.defer(onCall, self, method, table.pack(...), os.clock())
+	end
+end
+
+local function onEvent(remote, args, t)
+	if not state.running then
+		return
+	end
+	pcall(function()
+		local path = remote:GetFullName()
+		if state.mode == "noise" then
+			noise["E:" .. path] = true
+		elseif state.mode == "record" then
+			if noise["E:" .. path] or #items >= MAX_ITEMS then
+				return
+			end
+			eventSeen[path] = (eventSeen[path] or 0) + 1
+			if eventSeen[path] > MAX_PER_EVENT then
+				return
+			end
+			pushItem({
+				kind = "event", remote = remote, path = path,
+				desc = serializeArgs(args), t = t, sync = false,
+			})
+		end
+	end)
+end
+
+local function collectEvents()
+	local out = {}
+	local roots = {
+		game:GetService("ReplicatedStorage"),
+		game:GetService("ReplicatedFirst"),
+		Players.LocalPlayer,
+		Players.LocalPlayer and Players.LocalPlayer.Character,
+	}
+	for _, root in pairs(roots) do
+		local ok, descendants = pcall(function() return root:GetDescendants() end)
+		if ok then
+			for _, inst in ipairs(descendants) do
+				local cn = inst.ClassName
+				if cn == "RemoteEvent" or cn == "UnreliableRemoteEvent" then
+					out[#out + 1] = inst
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function startListening()
+	disconnectAll(listenConns)
+	for _, remote in ipairs(collectEvents()) do
+		local ok, conn = pcall(function()
+			return remote.OnClientEvent:Connect(function(...)
+				onEvent(remote, table.pack(...), os.clock())
+			end)
+		end)
+		if ok then
+			table.insert(listenConns, conn)
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- Hooks: installed once per session; only the handler is swapped on rerun
+----------------------------------------------------------------------
+if not _G.__FMHooked then
+	local installed = { namecall = false, fn = 0 }
+	local recent = setmetatable({}, { __mode = "k" })
+
+	if hasNamecall then
+		installed.namecall = pcall(function()
+			local oldNamecall
+			oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+				local method = getnamecallmethod()
+				if (method == "FireServer" or method == "InvokeServer") and not checkcaller() then
+					if typeof(self) == "Instance" then
+						recent[self] = os.clock()
+					end
+					local handler = _G.__FMHandler
+					if handler then
+						pcall(handler, self, method, ...)
+					end
+				end
+				if setnamecallmethod then
+					setnamecallmethod(method)
+				end
+				return oldNamecall(self, ...)
+			end))
+		end)
+	end
+
+	if hasFnHook then
+		for _, pair in ipairs({
+			{ "RemoteEvent", "FireServer" },
+			{ "RemoteFunction", "InvokeServer" },
+			{ "UnreliableRemoteEvent", "FireServer" },
+		}) do
+			local className, methodName = pair[1], pair[2]
+			if pcall(function()
+				local inst = Instance.new(className)
+				local fn = inst[methodName]
+				inst:Destroy()
+				local old
+				old = hookfunction(fn, newcclosure(function(self, ...)
+					if not checkcaller() and self ~= nil then
+						local t = recent[self]
+						if not (t and os.clock() - t < 0.01) then
+							local handler = _G.__FMHandler
+							if handler then
+								pcall(handler, self, methodName, ...)
+							end
+						end
+					end
+					return old(self, ...)
+				end))
+			end) then
+				installed.fn += 1
+			end
+		end
+	end
+	_G.__FMHooked = installed
+end
+local hooked = _G.__FMHooked
+
+----------------------------------------------------------------------
+-- Modes
+----------------------------------------------------------------------
+local function refreshButtons()
+	recBtn.Text = (state.mode == "record") and "Stop rec" or "Rec"
+	runBtn.Text = (state.mode == "replay") and "Stop" or "Run"
+	recBtn.BackgroundColor3 = (state.mode == "record") and COLORS.on or COLORS.item
+	runBtn.BackgroundColor3 = (state.mode == "replay") and COLORS.on or COLORS.item
+end
+
+local function setMode(mode)
+	local was = state.mode
+	state.mode = mode
+	local listen = (mode == "noise" or mode == "record")
+	local wasListen = (was == "noise" or was == "record")
+	if listen and not wasListen then
+		startListening()
+	elseif wasListen and not listen then
+		disconnectAll(listenConns)
+	end
+	if was == "replay" and mode ~= "replay" then
+		disconnectAll(syncConns)
+	end
+	refreshButtons()
+end
+
+----------------------------------------------------------------------
+-- Replay
+----------------------------------------------------------------------
+local function armSyncListeners()
+	disconnectAll(syncConns)
+	table.clear(evCount)
+	table.clear(consumed)
+	for i, it in ipairs(items) do
+		if it.kind == "event" and it.sync and evCount[it.remote] == nil then
+			if not it.remote:IsDescendantOf(game) then
+				return false, "event di baris " .. i .. " sudah hilang dari game, rekam ulang"
+			end
+			evCount[it.remote], consumed[it.remote] = 0, 0
+			local remote = it.remote
+			local ok, conn = pcall(function()
+				return remote.OnClientEvent:Connect(function()
+					evCount[remote] += 1
+				end)
+			end)
+			if not ok then
+				return false, "gagal listen event baris " .. i
+			end
+			table.insert(syncConns, conn)
+		end
+	end
+	return true
+end
+
+local function waitForEvent(remote)
+	local deadline = os.clock() + Config.EventTimeout
+	while state.running and state.mode == "replay" do
+		if evCount[remote] > consumed[remote] then
+			consumed[remote] = evCount[remote]
+			return true
+		end
+		if os.clock() >= deadline then
+			return false
+		end
+		task.wait() -- polls once per frame; this is the smallest possible reaction step
+	end
+	return false
+end
+
+local function fire(it, args)
+	if it.method == "FireServer" then
+		it.remote:FireServer(table.unpack(args, 1, args.n))
+	else
+		it.remote:InvokeServer(table.unpack(args, 1, args.n))
+	end
+end
+
+local function readNumber(box, fallback)
+	local n = tonumber(box.Text)
+	if n == nil or n ~= n or n < 0 or n > 60 then
+		box.Text = tostring(fallback)
+		return fallback
+	end
+	return n
+end
+
+local function failStop(text)
+	setMessage(text, false)
+	setMode("idle")
+end
+
+local function replayLoop()
+	local failStreak = 0
+	while state.running and state.mode == "replay" do
+		Config.StepSpeed = readNumber(speedBox, Config.StepSpeed)
+		Config.CycleDelay = readNumber(delayBox, Config.CycleDelay)
+		local prevT, aborted = nil, false
+		for i, it in ipairs(items) do
+			if not (state.running and state.mode == "replay") then
+				return
+			end
+			if it.kind == "event" then
+				if it.sync then
+					if not waitForEvent(it.remote) then
+						if state.mode ~= "replay" then
+							return
+						end
+						state.timeouts += 1
+						failStreak += 1
+						if failStreak >= Config.MaxConsecutiveFailures then
+							failStop("event baris " .. i .. " tidak datang " .. failStreak .. "x berturut-turut")
+							return
+						end
+						aborted = true
+						break
+					end
+					prevT = it.t
+				end
+			elseif it.enabled then
+				if not it.remote:IsDescendantOf(game) then
+					failStop("baris " .. i .. ": remote sudah hilang dari game")
+					return
+				end
+				local args = snapshotArgs(it.args)
+				if Config.Transform then
+					local ok, res = pcall(Config.Transform, i, args)
+					if ok and type(res) == "table" and type(res.n) == "number" then
+						args = res
+					end
+				end
+				local dead = firstDeadArg(args)
+				if dead then
+					failStop("baris " .. i .. ", argumen " .. dead .. ": Instance sudah hilang, rekam ulang")
+					return
+				end
+				if prevT and Config.StepSpeed > 0 then
+					local wait = (it.t - prevT) * Config.StepSpeed
+					if wait > 0 then
+						task.wait(wait)
+					end
+				end
+				prevT = it.t
+				local ok, err = pcall(fire, it, args)
+				if ok then
+					failStreak = 0
+				else
+					failStreak += 1
+					if failStreak >= Config.MaxConsecutiveFailures then
+						failStop("gagal " .. failStreak .. "x berturut-turut: " .. tostring(err))
+						return
+					end
+				end
+			end
+		end
+		if not aborted then
+			state.cycles += 1
+		end
+		task.wait(Config.CycleDelay)
+	end
+end
+
+----------------------------------------------------------------------
+-- Buttons + diagnostics
+----------------------------------------------------------------------
+track(noiseBtn.MouseButton1Click, function()
+	if state.mode ~= "idle" then
+		setMessage("selesaikan mode " .. state.mode .. " dulu", false)
+		return
+	end
+	setMode("noise")
+	setMessage("belajar noise " .. Config.NoiseLearnSeconds .. " detik: jangan ngapa-ngapain di game", true)
+	task.delay(Config.NoiseLearnSeconds, function()
+		if state.running and state.mode == "noise" then
+			local n = 0
+			for _ in pairs(noise) do
+				n += 1
+			end
+			setMode("idle")
+			setMessage(n .. " sumber noise dicatat dan akan diabaikan saat Rec", true)
+		end
+	end)
+end)
+
+track(recBtn.MouseButton1Click, function()
+	if state.mode == "record" then
+		setMode("idle")
+		table.sort(items, function(a, b)
+			if a.t ~= b.t then
+				return a.t < b.t
+			end
+			return a.seq < b.seq
+		end)
+		rebuildRows()
+		setMessage(#items .. " item terekam. tap '<-' event server buat TUNGGU, tap call buat skip, lalu Run", #items > 0)
+	elseif state.mode == "idle" then
+		clearItems()
+		setMode("record")
+		setMessage("merekam: mancing 1 putaran penuh lalu tekan Stop rec", true)
+	else
+		setMessage("selesaikan mode " .. state.mode .. " dulu", false)
+	end
+end)
+
+track(runBtn.MouseButton1Click, function()
+	if state.mode == "replay" then
+		setMode("idle")
+		setMessage("berhenti. siklus selesai: " .. state.cycles, true)
+		return
+	end
+	if state.mode ~= "idle" then
+		setMessage("selesaikan mode " .. state.mode .. " dulu", false)
+		return
+	end
+	local calls = 0
+	for _, it in ipairs(items) do
+		if it.kind == "call" and it.enabled then
+			calls += 1
+		end
+	end
+	if calls == 0 then
+		setMessage("belum ada call aktif, rekam dulu", false)
+		return
+	end
+	local armed, err = armSyncListeners()
+	if not armed then
+		setMessage(err, false)
+		return
+	end
+	state.cycles, state.timeouts = 0, 0
+	setMode("replay")
+	setMessage("jalan: " .. calls .. " call per siklus", true)
+	task.spawn(replayLoop)
+end)
+
+task.spawn(function()
+	while state.running and gui do
+		diagLabel.Text = string.format(
+			"hook namecall=%s fn=%d/3 | handler: %d | listener event: %d | item: %d | siklus: %d | timeout: %d | %s",
+			tostring(hooked.namecall), hooked.fn, state.raw, #listenConns, #items,
+			state.cycles, state.timeouts, state.mode)
+		task.wait(1)
+	end
+end)
+
+refreshButtons()
